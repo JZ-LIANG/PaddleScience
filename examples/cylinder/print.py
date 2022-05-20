@@ -1,53 +1,36 @@
 # Copyright (c) 2022 PaddlePaddle Authors. All Rights Reserved.
-#
+# 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
+# 
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
+# 
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# discrete time method
-
 import paddlescience as psci
 import numpy as np
 import paddle
-import os
-import wget
-import zipfile
 
 paddle.seed(1)
 np.random.seed(1)
 
-# paddle.enable_static()
 paddle.disable_static()
 
 
-# load real data 
-def GetRealPhyInfo(time, need_info=None):
-    # if real data don't exist, you need to download it.
-    if os.path.exists('./openfoam_cylinder_re100') == False:
-        data_set = 'https://dataset.bj.bcebos.com/PaddleScience/cylinder3D/openfoam_cylinder_re100/cylinder3d_openfoam_re100.zip'
-        wget.download(data_set)
-        with zipfile.ZipFile('cylinder3d_openfoam_re100.zip', 'r') as zip_ref:
-            zip_ref.extractall('openfoam_cylinder_re100')
-    real_data = np.load("openfoam_cylinder_re100/flow_re100_" + str(
-        int(time)) + "_xyzuvwp.npy")
+# load real data
+def GetRealPhyInfo(time):
+    real_data = np.load("flow_unsteady_re200/flow_re200_" + str(time) +
+                        "_xyzuvwp.npy")
     real_data = real_data.astype(np.float32)
-    if need_info == 'cord':
-        return real_data[:, 0:3]
-    elif need_info == 'physic':
-        return real_data[:, 3:7]
-    else:
-        return real_data
+    return real_data[:, 0:7]
 
 
-# define start time
+# define start time and time step
 start_time = 100
 
 cc = (0.0, 0.0)
@@ -62,10 +45,12 @@ geo.add_boundary(
     criteria=lambda x, y, z: ((x - cc[0])**2 + (y - cc[1])**2 - cr**2) < 1e-4)
 
 # discretize geometry
-geo_disc = geo.discretize(npoints=[200, 50, 4], method="uniform")
+print("ATTENTION! ####### The npoints must be same in your code! ########")
+geo_disc = geo.discretize(npoints=360000, method="sampling")
 
 # the real_cord need to be added in geo_disc
-geo_disc.user = GetRealPhyInfo(start_time, need_info='cord')
+real_cord = GetRealPhyInfo(start_time)[:, 0:3]
+geo_disc.user = real_cord
 
 # N-S equation
 pde = psci.pde.NavierStokes(
@@ -77,7 +62,7 @@ pde = psci.pde.NavierStokes(
 
 pde.set_time_interval([100.0, 110.0])
 
-# boundary condition on left side: u=1, v=w=0
+# boundary condition on left side: u=10, v=w=0
 bc_left_u = psci.bc.Dirichlet('u', rhs=1.0, weight=1.0)
 bc_left_v = psci.bc.Dirichlet('v', rhs=0.0, weight=1.0)
 bc_left_w = psci.bc.Dirichlet('w', rhs=0.0, weight=1.0)
@@ -104,7 +89,7 @@ net = psci.network.FCNet(
     num_ins=3, num_outs=4, num_layers=10, hidden_size=50, activation='tanh')
 
 # Loss
-loss = psci.loss.L2(p=2, data_weight=100.0)
+loss = psci.loss.L2(p=2)
 
 # Algorithm
 algo = psci.algorithm.PINNs(net=net, loss=loss)
@@ -115,24 +100,26 @@ opt = psci.optimizer.Adam(learning_rate=0.001, parameters=net.parameters())
 # Solver parameter
 solver = psci.solver.Solver(pde=pde_disc, algo=algo, opt=opt)
 
-# Solver time: (100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110]
 current_interior = np.zeros(
     (len(pde_disc.geometry.interior), 3)).astype(np.float32)
-current_user = GetRealPhyInfo(start_time, need_info='physic')[:, 0:3]
-for next_time in range(
-        int(pde_disc.time_internal[0]) + 1,
-        int(pde_disc.time_internal[1]) + 1):
-    print("### train next time=%f train task ###" % next_time)
-    solver.feed_data_interior_cur(current_interior)  # add u(n) interior
-    solver.feed_data_user_cur(current_user)  # add u(n) user 
-    solver.feed_data_user_next(GetRealPhyInfo(
-        next_time, need_info='physic'))  # add u(n+1) user
-    next_uvwp = solver.solve(num_epoch=2000)
-    # Save vtk
-    file_path = "train_cylinder_unsteady_re100/cylinder3d_train_rslt_" + str(
-        next_time)
-    psci.visu.save_vtk(
-        filename=file_path, geo_disc=pde_disc.geometry, data=next_uvwp)
-    # current_info need to be modified as follows: current_time -> next time
-    current_interior = np.array(next_uvwp[0])[:, 0:3]
-    current_user = np.array(next_uvwp[-1])[:, 0:3]
+solver.feed_data_interior_cur(current_interior)  # add u(n) interior
+solver.feed_data_user_cur(GetRealPhyInfo(100)[:, 3:6])  # add u(n) user 
+solver.feed_data_user_next(GetRealPhyInfo(101)[:, 3:7])  # add u(n+1) user
+
+print("Please attntion the static input shape")
+print("The interior shape is:")
+print(geo_disc.interior.shape)
+print("The real data shape is:")
+print(geo_disc.user.shape)
+print("The boundary shape is as follows:")
+print(geo_disc.boundary['left'].shape)
+print(geo_disc.boundary['right'].shape)
+print(geo_disc.boundary['circle'].shape) 
+totoal_points = geo_disc.interior.shape[0] + geo_disc.boundary['left'].shape[0] + geo_disc.boundary['right'].shape[0] + geo_disc.boundary['circle'].shape[0] + geo_disc.user.shape[0]
+print("totoal_points: ", totoal_points)
+print("per card points: ", totoal_points / 8.0 / 1.0)
+print("Please attntion the static label shape")
+print("The label shape is:")
+n = len(solver.labels)
+for i in range(n):
+    print(len(solver.labels[i]))

@@ -16,9 +16,6 @@ import numpy as np
 import os
 import paddlescience as psci
 import paddle
-import os
-import wget
-import zipfile
 from paddle.incubate.autograd import prim2orig, enable_prim, prim_enabled
 from utils import l2_norm_square, compute_bc_loss, compute_eq_loss, compile_and_convert_back_to_program, create_inputs_var, create_labels_var, convert_to_distributed_program, data_parallel_partition
 
@@ -31,25 +28,34 @@ enable_prim()
 # define start time and time step
 start_time = 100
 time_step = 1
+npoints = 40000
 
 
-# load real data 
-def GetRealPhyInfo(time, need_info=None):
-    # if real data don't exist, you need to download it.
-    if os.path.exists('./openfoam_cylinder_re100') == False:
-        data_set = 'https://dataset.bj.bcebos.com/PaddleScience/cylinder3D/openfoam_cylinder_re100/cylinder3d_openfoam_re100.zip'
-        wget.download(data_set)
-        with zipfile.ZipFile('cylinder3d_openfoam_re100.zip', 'r') as zip_ref:
-            zip_ref.extractall('openfoam_cylinder_re100')
-    real_data = np.load("openfoam_cylinder_re100/flow_re100_" + str(
-        int(time)) + "_xyzuvwp.npy")
+# load real data
+def GetRealPhyInfo(time, need_cord=False, need_physic=False):
+    real_data = np.load("./flow_unsteady_re200/flow_re200_" + str(time) +
+                        "_xyzuvwp.npy")
     real_data = real_data.astype(np.float32)
-    if need_info == 'cord':
+    if need_cord is False and need_physic is False:
+        print("Error: you need to get cord or get physic infomation")
+        exit()
+    elif need_cord is True and need_physic is True:
+        return real_data
+    elif need_cord is True and need_physic is False:
         return real_data[:, 0:3]
-    elif need_info == 'physic':
+    elif need_cord is False and need_physic is True:
         return real_data[:, 3:7]
     else:
-        return real_data
+        pass
+
+
+# get init physic infomation
+def GenInitPhyInfo(xyz):
+    uvw = np.zeros((len(xyz), 3)).astype(np.float32)
+    for i in range(len(xyz)):
+        if abs(xyz[i][0] - (-8)) < 1e-4:
+            uvw[i][0] = 1.0
+    return uvw
 
 
 cc = (0.0, 0.0)
@@ -64,10 +70,10 @@ geo.add_boundary(
     criteria=lambda x, y, z: ((x - cc[0])**2 + (y - cc[1])**2 - cr**2) < 1e-4)
 
 # discretize geometry
-geo_disc = geo.discretize(npoints=[200, 50, 4], method="uniform")
-
+geo_disc = geo.discretize(npoints=npoints, method="sampling")
 # the real_cord need to be added in geo_disc
-geo_disc.user = GetRealPhyInfo(start_time, need_info='cord')
+real_cord = GetRealPhyInfo(start_time, need_cord=True)
+geo_disc.user = real_cord
 
 # N-S equation
 pde = psci.pde.NavierStokes(
@@ -99,7 +105,7 @@ pde.add_bc("circle", bc_circle_u, bc_circle_v, bc_circle_w)
 
 # pde discretization 
 pde_disc = pde.discretize(
-    time_method="implicit", time_step=1, geo_disc=geo_disc)
+    time_method="implicit", time_step=time_step, geo_disc=geo_disc)
 
 # declare network
 net = psci.network.FCNet(
@@ -108,13 +114,10 @@ net = psci.network.FCNet(
 # Algorithm
 algo = psci.algorithm.PINNs(net=net, loss=None)
 
-# Get data shape
-npoints = len(pde_disc.geometry.interior)
-data_size = len(geo_disc.user)
-
 # create inputs/labels and its attributes
 inputs, inputs_attr = algo.create_inputs(pde_disc)
 labels, labels_attr = algo.create_labels(pde_disc)
+
 
 main_program = paddle.static.Program()
 startup_program = paddle.static.Program()
@@ -123,7 +126,7 @@ with paddle.static.program_guard(main_program, startup_program):
     # build and apply network
     algo.net.make_network_static()
     inputs_var = create_inputs_var(inputs)
-    labels_var = create_labels_var(labels, npoints, data_size)
+    labels_var = create_labels_var(labels, npoints)
     outputs_var = [algo.net.nn_func(var) for var in inputs_var]
 
     # bc loss
@@ -143,16 +146,15 @@ with paddle.static.program_guard(main_program, startup_program):
 
     # total_loss
     total_loss = paddle.sqrt(bc_loss + output_var_0_eq_loss +
-                             output_var_4_eq_loss + 100.0 * data_loss)
+                             output_var_4_eq_loss + data_loss)
     opt_ops, param_grads = paddle.optimizer.Adam(0.001).minimize(total_loss)
 
 # data parallel
 nranks = paddle.distributed.get_world_size()
 if nranks > 1:
-    main_program, startup_program = convert_to_distributed_program(
-        main_program, startup_program, param_grads)
+    main_program, startup_program = convert_to_distributed_program(main_program, startup_program, param_grads)
 
-with paddle.static.program_guard(main_program, startup_program):
+with paddle.static.program_guard(main_program, startup_program):    
     if prim_enabled():
         prim2orig(main_program.block(0))
 
@@ -181,7 +183,7 @@ train_epoch = 2000
 num_time_step = 10
 current_interior = np.zeros(
     (len(pde_disc.geometry.interior), 3)).astype(np.float32)
-current_user = GetRealPhyInfo(start_time, need_info='physic')[:, 0:3]
+current_user = GetRealPhyInfo(start_time, need_physic=True)[:, 0:3]
 for i in range(num_time_step):
     next_time = start_time + (i + 1) * time_step
     print("############# train next time=%f train task ############" %
@@ -191,11 +193,9 @@ for i in range(num_time_step):
     self_lables = algo.feed_data_user_cur(self_lables, labels_attr,
                                           current_user)
     self_lables = algo.feed_data_user_next(
-        self_lables,
-        labels_attr,
-        GetRealPhyInfo(
-            next_time, need_info='physic'))
-    self_lables = data_parallel_partition(self_lables, time_step=i)
+        self_lables, labels_attr, GetRealPhyInfo(
+            next_time, need_physic=True))
+    self_lables = data_parallel_partition(self_lables, time_step = i)
 
     for j in range(len(self_lables)):
         feeds['label' + str(j)] = self_lables[j]
@@ -204,10 +204,9 @@ for i in range(num_time_step):
         out = exe.run(main_program, feed=feeds, fetch_list=fetches)
         print("autograd epoch: " + str(k + 1), "    loss:", out[0])
     next_uvwp = out[1:]
-    # Save vtk
-    file_path = "train_flow_unsteady_re200/fac3d_train_rslt_" + str(next_time)
-    psci.visu.save_vtk(
-        filename=file_path, geo_disc=pde_disc.geometry, data=next_uvwp)
+    # # Save vtk
+    # file_path = "train_flow_unsteady_re200/fac3d_train_rslt_" + str(next_time)
+    # psci.visu.save_vtk(filename=file_path, geo_disc=pde_disc.geometry, data=next_uvwp)
 
     # next_info -> current_info
     next_interior = np.array(next_uvwp[0])
